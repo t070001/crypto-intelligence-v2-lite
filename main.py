@@ -14,16 +14,17 @@ from indicators import calc_volume_ratio
 from output_formatter import MarketSnapshot
 from output_formatter import Recommendation
 from output_formatter import RiskPlan
-from output_formatter import format_console_top10
+from output_formatter import format_telegram_top10
 from signal_generator import generate_entry_signal
+from telegram_bot import send_message
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run Project_Whale_Footprint v2.0 Lite scan."
     )
-    parser.add_argument("--limit", type=int, default=30)
-    parser.add_argument("--min-volume", type=float, default=10_000_000)
+    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--min-volume", type=float, default=20_000_000)
     parser.add_argument("--symbol", type=str, default=None)
     return parser.parse_args()
 
@@ -291,29 +292,19 @@ def main() -> None:
     )
     recommendations: list[Recommendation] = []
 
-    print(f"Scanning {len(tickers)} symbols...")
-
-    for index, ticker in enumerate(tickers, start=1):
-        symbol = ticker["symbol"]
+    for ticker in tickers:
         try:
             recommendation = scan_symbol(fetcher, ticker)
-        except Exception as exc:
-            print(f"[{index}/{len(tickers)}] {symbol}: ERROR {exc}")
+        except Exception:
             continue
 
         if recommendation is None:
-            print(f"[{index}/{len(tickers)}] {symbol}: no signal")
             continue
 
-        print(
-            f"[{index}/{len(tickers)}] {symbol}: "
-            f"{recommendation.mode} score={recommendation.score:.1f}"
-        )
         recommendations.append(recommendation)
 
     ranked = assign_ranks(recommendations)
-    print()
-    print(format_console_top10(ranked))
+    send_message(format_telegram_top10(ranked))
 
 
 if __name__ == "__main__":

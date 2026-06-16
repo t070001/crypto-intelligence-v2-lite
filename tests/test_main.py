@@ -7,6 +7,7 @@ from main import _latest_oi_value_for_h4
 from main import _market_type
 from main import _score_recommendation
 from main import assign_ranks
+from main import parse_args
 from output_formatter import MarketSnapshot
 from output_formatter import Recommendation
 from output_formatter import RiskPlan
@@ -21,6 +22,18 @@ def test_build_risk_plan_uses_conservative_structural_target():
     assert risk.tp1 == 115.0
     assert risk.tp2 == 130.0
     assert round(risk.theoretical_rr, 2) == 1.67
+
+
+def test_parse_args_supports_scan_arguments(monkeypatch):
+    monkeypatch.setattr(
+        "sys.argv",
+        ["main.py", "--limit", "5", "--min-volume", "20000000"],
+    )
+
+    args = parse_args()
+
+    assert args.limit == 5
+    assert args.min_volume == 20_000_000
 
 
 def test_score_recommendation_penalizes_extension():
