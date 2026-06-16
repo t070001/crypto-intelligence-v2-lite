@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import replace
 
 import numpy as np
@@ -16,6 +17,8 @@ from output_formatter import Recommendation
 from output_formatter import RiskPlan
 from output_formatter import format_telegram_top10
 from signal_generator import generate_entry_signal
+from signal_generator import get_intrabar_window
+from signal_generator import calc_prior_swing_low
 from telegram_bot import send_message
 
 
@@ -26,6 +29,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--min-volume", type=float, default=20_000_000)
     parser.add_argument("--symbol", type=str, default=None)
+    parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
 
@@ -134,6 +138,165 @@ def _recent_taker_buy_ratio(df_15m, h4_row) -> float:
 
     value = float(eligible["taker_buy_ratio"].mean())
     return value if np.isfinite(value) else 0.0
+
+
+def _diagnose_symbol(fetcher: DataFetcher, ticker: dict) -> dict[str, Counter]:
+    counters = {
+        "mode_a": Counter(),
+        "mode_b": Counter(),
+    }
+    symbol = ticker["symbol"]
+    h4 = fetcher.fetch_h4(symbol)
+    m15 = fetcher.fetch_intraday_15m(symbol)
+    oi = fetcher.fetch_oi(symbol, period="4h")
+    oi_aligned = fetcher.align_oi_to_klines(oi, h4)
+
+    if len(h4) < 51:
+        counters["mode_a"]["not_enough_h4"] += 1
+        counters["mode_b"]["not_enough_h4"] += 1
+        return counters
+
+    h4["atr14"] = calc_atr(h4)
+    h4["volume_ratio"] = calc_volume_ratio(h4)
+    closed_index = _last_closed_h4_index(h4)
+
+    if closed_index is None or closed_index < 50:
+        counters["mode_a"]["no_closed_h4"] += 1
+        counters["mode_b"]["no_closed_h4"] += 1
+        return counters
+
+    h4_row = h4.iloc[closed_index]
+    h4_history = h4.iloc[:closed_index]
+    m15 = _closed_15m_context(m15, h4_row)
+    atr = float(h4_row["atr14"])
+
+    if not np.isfinite(atr):
+        counters["mode_a"]["atr_nan"] += 1
+        counters["mode_b"]["atr_nan"] += 1
+        return counters
+
+    # Mode A diagnostics.
+    swing_low = calc_prior_swing_low(h4_history)
+    window = get_intrabar_window(m15, h4_row)
+
+    if swing_low is None or window.empty:
+        counters["mode_a"]["no_swing_or_15m"] += 1
+    else:
+        sweep_mask = (
+            (window["low"] < swing_low)
+            & (((swing_low - window["low"]) / swing_low) <= 0.005)
+        )
+        sweep_rows = window[sweep_mask]
+
+        if sweep_rows.empty:
+            counters["mode_a"]["fail_sweep"] += 1
+        else:
+            counters["mode_a"]["sweep_candidate"] += 1
+            first_sweep = sweep_rows.iloc[0]
+            reclaim_candidates = window[window["open_time"] >= first_sweep["open_time"]]
+            reclaim_rows = reclaim_candidates[
+                reclaim_candidates["close"] > reclaim_candidates["vwap_rolling_24h"]
+            ]
+
+            if reclaim_rows.empty:
+                counters["mode_a"]["fail_vwap_reclaim"] += 1
+            else:
+                counters["mode_a"]["vwap_reclaim_candidate"] += 1
+                wick_ratio = (
+                    (reclaim_rows["close"] - reclaim_rows["low"])
+                    / (reclaim_rows["high"] - reclaim_rows["low"]).replace(0, np.nan)
+                )
+                wick_rows = reclaim_rows[wick_ratio > 0.5]
+
+                if wick_rows.empty:
+                    counters["mode_a"]["fail_wick"] += 1
+                else:
+                    counters["mode_a"]["wick_candidate"] += 1
+                    taker_rows = wick_rows[wick_rows["taker_buy_ratio"] > 1.1]
+
+                    if taker_rows.empty:
+                        counters["mode_a"]["fail_taker"] += 1
+                    else:
+                        counters["mode_a"]["final_candidate"] += 1
+
+    # Mode B diagnostics.
+    platform = calc_breakout_platform(h4_history)
+
+    if not platform.found or platform.breakout_price is None:
+        counters["mode_b"]["fail_platform"] += 1
+        return counters
+
+    if float(h4_row["close"]) <= platform.breakout_price:
+        counters["mode_b"]["fail_breakout_close"] += 1
+        return counters
+
+    counters["mode_b"]["breakout_candidate"] += 1
+
+    oi_change = _oi_change_pct(oi_aligned, h4_row)
+
+    if oi_change <= 2.5:
+        counters["mode_b"]["fail_oi"] += 1
+        return counters
+
+    counters["mode_b"]["oi_candidate"] += 1
+    cvd_zscore = _latest_cvd_zscore(m15, h4_row)
+
+    if cvd_zscore <= 0.5:
+        counters["mode_b"]["fail_cvd"] += 1
+        return counters
+
+    counters["mode_b"]["cvd_candidate"] += 1
+    taker_buy_ratio = _recent_taker_buy_ratio(m15, h4_row)
+
+    if taker_buy_ratio <= 1.15:
+        counters["mode_b"]["fail_taker"] += 1
+    else:
+        counters["mode_b"]["final_candidate"] += 1
+
+    return counters
+
+
+def _merge_diagnostics(target: dict[str, Counter], source: dict[str, Counter]) -> None:
+    target["mode_a"].update(source["mode_a"])
+    target["mode_b"].update(source["mode_b"])
+
+
+def _format_diagnostics(counters: dict[str, Counter]) -> str:
+    mode_a = counters["mode_a"]
+    mode_b = counters["mode_b"]
+    lines = [
+        "Diagnostics",
+        (
+            "Mode A: "
+            f"sweep={mode_a['sweep_candidate']} "
+            f"vwap={mode_a['vwap_reclaim_candidate']} "
+            f"wick={mode_a['wick_candidate']} "
+            f"final={mode_a['final_candidate']}"
+        ),
+        (
+            "Mode A rejects: "
+            f"sweep={mode_a['fail_sweep']} "
+            f"vwap={mode_a['fail_vwap_reclaim']} "
+            f"wick={mode_a['fail_wick']} "
+            f"taker={mode_a['fail_taker']}"
+        ),
+        (
+            "Mode B: "
+            f"breakout={mode_b['breakout_candidate']} "
+            f"oi={mode_b['oi_candidate']} "
+            f"cvd={mode_b['cvd_candidate']} "
+            f"final={mode_b['final_candidate']}"
+        ),
+        (
+            "Mode B rejects: "
+            f"platform={mode_b['fail_platform']} "
+            f"breakout_close={mode_b['fail_breakout_close']} "
+            f"oi={mode_b['fail_oi']} "
+            f"cvd={mode_b['fail_cvd']} "
+            f"taker={mode_b['fail_taker']}"
+        ),
+    ]
+    return "\n".join(lines)
 
 
 def _build_risk_plan(entry: float, atr: float, h4_history) -> RiskPlan:
@@ -291,9 +454,14 @@ def main() -> None:
         symbol=args.symbol,
     )
     recommendations: list[Recommendation] = []
+    diagnostics = {
+        "mode_a": Counter(),
+        "mode_b": Counter(),
+    }
 
     for ticker in tickers:
         try:
+            _merge_diagnostics(diagnostics, _diagnose_symbol(fetcher, ticker))
             recommendation = scan_symbol(fetcher, ticker)
         except Exception:
             continue
@@ -304,6 +472,8 @@ def main() -> None:
         recommendations.append(recommendation)
 
     ranked = assign_ranks(recommendations)
+    if not args.quiet:
+        print(_format_diagnostics(diagnostics))
     send_message(format_telegram_top10(ranked))
 
 

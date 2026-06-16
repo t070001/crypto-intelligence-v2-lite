@@ -60,8 +60,8 @@ def check_mode_a(
     atr: float,
     swing_lookback: int = 20,
     max_sweep_pct: float = 0.005,
-    wick_threshold: float = 0.7,
-    taker_buy_ratio_threshold: float = 1.2,
+    wick_threshold: float = 0.5,
+    taker_buy_ratio_threshold: float = 1.1,
 ) -> EntrySignal | None:
     swing_low = calc_prior_swing_low(h4_history, swing_lookback)
 
@@ -146,8 +146,8 @@ def check_mode_b(
     oi_aligned: pd.DataFrame,
     platform: BreakoutPlatform,
     atr: float,
-    oi_threshold: float = 0.05,
-    cvd_z_threshold: float = 1.0,
+    oi_threshold: float = 0.025,
+    cvd_z_threshold: float = 0.5,
     taker_buy_ratio_threshold: float = 1.15,
 ) -> EntrySignal | None:
     if (
