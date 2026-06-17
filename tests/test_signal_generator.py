@@ -105,8 +105,8 @@ def test_check_mode_a_requires_sweep_then_reclaim():
 
 def test_check_mode_a_rejects_deep_breakdown():
     df_15m = _m15_window_for_mode_a()
-    df_15m.loc[0, "low"] = 98.0
-    df_15m.loc[1, "low"] = 98.0
+    df_15m.loc[0, "low"] = 97.8
+    df_15m.loc[1, "low"] = 97.8
 
     signal = check_mode_a(
         symbol="TESTUSDT",

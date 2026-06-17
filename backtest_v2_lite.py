@@ -113,6 +113,7 @@ def simulate_position(
     tp1_force_atr: float = 2.0,
     trailing_atr: float = 1.0,
     taker_sell_ratio_threshold: float = 1.5,
+    time_stop_h4_bars: int | None = None,
 ) -> TradeResult | None:
     future = _slice_after_entry(df_15m, signal.entry_time).head(max_hold_bars)
 
@@ -131,7 +132,27 @@ def simulate_position(
     lows_seen: list[float] = []
     highs_seen: list[float] = []
 
-    for _, row in future.iterrows():
+    # Time stop: count 4H-equivalent bars elapsed (20h = 5x4H = 80x15m)
+    time_stop_15m_bars = (time_stop_h4_bars * 16) if time_stop_h4_bars else None
+
+    for bar_count, row in future.iterrows():
+        # Time stop check: max hold bars exceeded without TP1
+        if (
+            time_stop_15m_bars is not None
+            and state == PositionState.HOLDING_FULL
+            and bar_count >= time_stop_15m_bars
+        ):
+            return _finalize_trade(
+                signal=signal,
+                exit_time=row["close_time"],
+                exit_price=float(row["close"]),
+                sl_hard=sl_hard,
+                tp1_price=tp1_price,
+                trailing_stop=trailing_stop,
+                reason="Time Stop",
+                lows_seen=lows_seen,
+                highs_seen=highs_seen,
+            )
         low = float(row["low"])
         high = float(row["high"])
         close = float(row["close"])
@@ -209,7 +230,19 @@ def run_symbol_backtest(
     df_15m: pd.DataFrame,
     oi_aligned: pd.DataFrame,
     min_history_bars: int = 50,
+    time_stop_h4_bars: int | None = None,
+    mode_a_time_stop_h4_bars: int | None = None,
 ) -> list[TradeResult]:
+    """Run backtest with optional Mode-A-only time stop.
+
+    Parameters
+    ----------
+    time_stop_h4_bars : int | None
+        Applied to ALL signals (used for S2 global test).
+    mode_a_time_stop_h4_bars : int | None
+        Applied ONLY to Mode A signals; Mode B uses baseline exit.
+        Takes precedence over time_stop_h4_bars for Mode A.
+    """
     df_4h = df_4h.copy()
     df_4h["atr14"] = calc_atr(df_4h)
     trades: list[TradeResult] = []
@@ -244,9 +277,15 @@ def run_symbol_backtest(
         if signal is None:
             continue
 
+        # Determine time stop: Mode A gets mode_a_time_stop_h4_bars if set
+        effective_time_stop = time_stop_h4_bars
+        if signal.mode == "MODE_A_SWEEP_RECLAIM" and mode_a_time_stop_h4_bars is not None:
+            effective_time_stop = mode_a_time_stop_h4_bars
+
         trade = simulate_position(
             signal=signal,
             df_15m=df_15m,
+            time_stop_h4_bars=effective_time_stop,
         )
 
         if trade is None:
